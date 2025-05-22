@@ -12,6 +12,597 @@ import colorsys
 # Настройка страницы с адаптивным макетом
 st.set_page_config(page_title="Фамильное древо", layout="wide", initial_sidebar_state="collapsed")
 
+# --- Функции визуализации в начале файла ---
+
+def calculate_relation_levels(members, relationships, central_person_id):
+    """
+    Вычисляет уровни родства всех членов семьи относительно центрального узла
+    
+    Returns:
+        dict: Словарь {id: уровень}, где уровень:
+            0 - центральный человек
+            1 - прямая семья (родители, дети, супруг/а)
+            2 - близкие родственники (бабушки/дедушки, братья/сестры)
+            3 - дальние родственники (дяди/тети, двоюродные)
+    """
+    levels = {central_person_id: 0}  # Центральный узел
+    
+    # Строим граф для анализа связей
+    G = build_family_graph(members, relationships)
+    
+    # Находим родителей, детей и супруга
+    parents = list(G.predecessors(central_person_id))
+    children = list(G.successors(central_person_id))
+    
+    # Находим супруга (общие дети)
+    spouse_ids = []
+    for child_id in children:
+        child_parents = list(G.predecessors(child_id))
+        for parent_id in child_parents:
+            if parent_id != central_person_id:
+                spouse_ids.append(parent_id)
+    
+    # Прямая семья (уровень 1)
+    for member_id in parents + children + spouse_ids:
+        levels[member_id] = 1
+    
+    # Находим братьев/сестер (общие родители)
+    siblings = []
+    for parent_id in parents:
+        for child_id in G.successors(parent_id):
+            if child_id != central_person_id and child_id not in siblings:
+                siblings.append(child_id)
+    
+    # Находим бабушек/дедушек (родители родителей)
+    grandparents = []
+    for parent_id in parents:
+        for gp_id in G.predecessors(parent_id):
+            if gp_id not in grandparents:
+                grandparents.append(gp_id)
+    
+    # Близкие родственники (уровень 2)
+    for member_id in siblings + grandparents:
+        levels[member_id] = 2
+    
+    # Дяди/тети (братья/сестры родителей)
+    uncles_aunts = []
+    for parent_id in parents:
+        parent_siblings = []
+        parent_parents = list(G.predecessors(parent_id))
+        for gp_id in parent_parents:
+            for child_id in G.successors(gp_id):
+                if child_id != parent_id and child_id not in uncles_aunts:
+                    uncles_aunts.append(child_id)
+    
+    # Племянники (дети братьев/сестер)
+    niblings = []
+    for sibling_id in siblings:
+        for child_id in G.successors(sibling_id):
+            if child_id not in niblings:
+                niblings.append(child_id)
+    
+    # Двоюродные (дети дядь/теть)
+    cousins = []
+    for ua_id in uncles_aunts:
+        for child_id in G.successors(ua_id):
+            if child_id not in cousins:
+                cousins.append(child_id)
+    
+    # Дальние родственники (уровень 3)
+    for member_id in uncles_aunts + niblings + cousins:
+        levels[member_id] = 3
+    
+    return levels
+
+def get_relation_to_person(members, relationships, central_id, person_id):
+    """
+    Определяет отношение человека к центральному узлу
+    """
+    if central_id == person_id:
+        return "Это я"
+    
+    # Строим граф для анализа отношений
+    G = nx.DiGraph()
+    for member in members:
+        G.add_node(member["id"], **member)
+    for rel in relationships:
+        G.add_edge(rel["parent_id"], rel["child_id"])
+    
+    # Находим прямых родителей центрального узла
+    parents = list(G.predecessors(central_id))
+    
+    # Находим прямых детей центрального узла
+    children = list(G.successors(central_id))
+    
+    # Находим братьев/сестер центрального узла (имеют тех же родителей)
+    siblings = []
+    for parent_id in parents:
+        for child_id in G.successors(parent_id):
+            if child_id != central_id and child_id not in siblings:
+                siblings.append(child_id)
+    
+    # Проверяем родительские связи
+    if person_id in parents:
+        person = next(m for m in members if m["id"] == person_id)
+        return "Отец" if person["gender"] == "Мужской" else "Мать"
+    
+    # Проверяем супружеские связи
+    marriage_pairs = find_marriage_pairs(relationships)
+    for pair in marriage_pairs:
+        if central_id in pair and person_id in pair:
+            person = next(m for m in members if m["id"] == person_id)
+            return "Муж" if person["gender"] == "Мужской" else "Жена"
+    
+    # Проверяем, является ли человек ребенком
+    if person_id in children:
+        person = next(m for m in members if m["id"] == person_id)
+        return "Сын" if person["gender"] == "Мужской" else "Дочь"
+    
+    # Проверяем, является ли человек братом/сестрой
+    if person_id in siblings:
+        person = next(m for m in members if m["id"] == person_id)
+        return "Брат" if person["gender"] == "Мужской" else "Сестра"
+    
+    # Проверяем бабушек/дедушек (родители родителей)
+    for parent_id in parents:
+        grandparents = list(G.predecessors(parent_id))
+        if person_id in grandparents:
+            person = next(m for m in members if m["id"] == person_id)
+            return "Дедушка" if person["gender"] == "Мужской" else "Бабушка"
+    
+    # Проверяем дядей/теть (братья/сестры родителей)
+    uncles_aunts = []
+    for parent_id in parents:
+        parent_parents = list(G.predecessors(parent_id))
+        for grandparent in parent_parents:
+            for uncle_aunt in G.successors(grandparent):
+                if uncle_aunt != parent_id and uncle_aunt not in uncles_aunts:
+                    uncles_aunts.append(uncle_aunt)
+    
+    if person_id in uncles_aunts:
+        person = next(m for m in members if m["id"] == person_id)
+        return "Дядя" if person["gender"] == "Мужской" else "Тетя"
+    
+    # Проверяем двоюродных братьев/сестер (дети дядей/теть)
+    cousins = []
+    for uncle_aunt in uncles_aunts:
+        for cousin in G.successors(uncle_aunt):
+            if cousin not in cousins:
+                cousins.append(cousin)
+    
+    if person_id in cousins:
+        person = next(m for m in members if m["id"] == person_id)
+        return "Двоюродный брат" if person["gender"] == "Мужской" else "Двоюродная сестра"
+    
+    # Проверяем племянников (дети братьев/сестер)
+    niblings = []
+    for sibling in siblings:
+        for child in G.successors(sibling):
+            if child not in niblings:
+                niblings.append(child)
+    
+    if person_id in niblings:
+        person = next(m for m in members if m["id"] == person_id)
+        return "Племянник" if person["gender"] == "Мужской" else "Племянница"
+    
+    # По умолчанию, если отношение не определено
+    return "Родственник"
+
+def find_marriage_pairs(relationships):
+    """
+    Находит супружеские пары на основе общих детей
+    """
+    # Словарь для группировки родителей по детям
+    parents_by_child = {}
+    
+    for rel in relationships:
+        child_id = rel["child_id"]
+        parent_id = rel["parent_id"]
+        
+        if child_id not in parents_by_child:
+            parents_by_child[child_id] = []
+        
+        parents_by_child[child_id].append(parent_id)
+    
+    # Находим пары родителей, у которых есть общие дети
+    marriage_pairs = set()
+    for child_id, parents in parents_by_child.items():
+        if len(parents) >= 2:
+            for i in range(len(parents)):
+                for j in range(i + 1, len(parents)):
+                    pair = tuple(sorted([parents[i], parents[j]]))
+                    marriage_pairs.add(pair)
+    
+    return list(marriage_pairs)
+
+def get_relation_group(relation):
+    """
+    Группирует типы отношений для размещения на концентрических кругах
+    """
+    parent_relations = ["Отец", "Мать"]
+    child_relations = ["Сын", "Дочь"]
+    spouse_relations = ["Муж", "Жена"]
+    grandparent_relations = ["Дедушка", "Бабушка"]
+    sibling_relations = ["Брат", "Сестра"]
+    uncle_aunt_relations = ["Дядя", "Тетя"]
+    cousin_relations = ["Двоюродный брат", "Двоюродная сестра"]
+    nibling_relations = ["Племянник", "Племянница"]
+    
+    if relation in parent_relations:
+        return "parents"
+    elif relation in child_relations:
+        return "children"
+    elif relation in spouse_relations:
+        return "spouse"
+    elif relation in grandparent_relations:
+        return "grandparents"
+    elif relation in sibling_relations:
+        return "siblings"
+    elif relation in uncle_aunt_relations:
+        return "uncles_aunts"
+    elif relation in cousin_relations:
+        return "cousins"
+    elif relation in nibling_relations:
+        return "niblings"
+    else:
+        return "other"
+
+def get_node_color(gender, level, color_scheme="standard"):
+    """
+    Определяет цвет узла в зависимости от пола, уровня родства и цветовой схемы
+    """
+    if color_scheme == "standard":
+        if gender == "Мужской":
+            # Оттенки синего для мужчин
+            colors = ["#0047AB", "#1E88E5", "#42A5F5", "#64B5F6", "#90CAF9"]
+        else:
+            # Оттенки розового для женщин
+            colors = ["#FF1493", "#FF69B4", "#FF80AB", "#F8BBD0", "#FCE4EC"]
+    
+    elif color_scheme == "contrast":
+        if gender == "Мужской":
+            # Контрастные синие
+            colors = ["#003366", "#0066CC", "#3399FF", "#66CCFF", "#99FFFF"]
+        else:
+            # Контрастные красные
+            colors = ["#990000", "#CC0000", "#FF0000", "#FF6666", "#FFCCCC"]
+    
+    elif color_scheme == "monochrome":
+        # Монохромная схема, разные оттенки серого
+        if gender == "Мужской":
+            colors = ["#222222", "#444444", "#666666", "#888888", "#AAAAAA"]
+        else:
+            colors = ["#333333", "#555555", "#777777", "#999999", "#BBBBBB"]
+    
+    else:  # Стандартная схема по умолчанию
+        if gender == "Мужской":
+            colors = ["#0047AB", "#1E88E5", "#42A5F5", "#64B5F6", "#90CAF9"]
+        else:
+            colors = ["#FF1493", "#FF69B4", "#FF80AB", "#F8BBD0", "#FCE4EC"]
+    
+    idx = min(level, len(colors)-1)
+    return colors[idx]
+
+def create_concentric_family_tree(members, relationships, central_person_id=3, show_names=True, show_relations=True, color_scheme="standard"):
+    """
+    Создает концентрическую визуализацию семейного древа с заданным центральным узлом.
+    
+    Args:
+        members: Список словарей с информацией о членах семьи
+        relationships: Список словарей с информацией о родственных связях
+        central_person_id: ID члена семьи, который будет в центре (по умолчанию Георгий Богданов, ID=3)
+        show_names: Показывать ли полные имена
+        show_relations: Показывать ли родственные связи
+        color_scheme: Цветовая схема ("standard", "contrast", "monochrome")
+        
+    Returns:
+        fig: Объект plotly Figure с визуализацией
+    """
+    import plotly.io as pio
+    
+    # Определяем, запущено ли приложение на мобильном устройстве
+    is_mobile = False
+    try:
+        if 'is_mobile' in st.session_state:
+            is_mobile = st.session_state.is_mobile
+    except ImportError:
+        pass
+    
+    # Вычисляем степень родства для каждого члена семьи относительно центрального узла
+    relation_levels = calculate_relation_levels(members, relationships, central_person_id)
+    
+    # Получаем центрального человека
+    central_person = next((m for m in members if m["id"] == central_person_id), None)
+    if not central_person:
+        return None
+    
+    # Создаем граф для анализа
+    G = build_family_graph(members, relationships)
+    
+    # Подготавливаем данные для визуализации
+    nodes_by_level = {}
+    labels = {}
+    node_colors = {}
+    
+    for member in members:
+        member_id = member["id"]
+        level = relation_levels.get(member_id, 4)  # Если уровень не определен, помещаем на 4й круг
+        
+        if level not in nodes_by_level:
+            nodes_by_level[level] = []
+        
+        nodes_by_level[level].append(member_id)
+        
+        # Определяем метку с именем и родством
+        relation = get_relation_to_person(members, relationships, central_person_id, member_id)
+        
+        # Для мобильного отображения - компактная версия имени
+        name_display = member['name']
+        if is_mobile:
+            # На мобильных устройствах укорачиваем длинные имена
+            name_parts = member['name'].split()
+            if len(name_parts) > 2:
+                if len(name_parts[0]) > 8 or len(name_parts[1]) > 8:
+                    # Если имя или фамилия длинные, показываем только первую букву отчества
+                    name_display = f"{name_parts[0]} {name_parts[1][0]}. {name_parts[-1]}"
+        
+        if member_id == central_person_id:
+            if show_names:
+                labels[member_id] = f"{name_display}<br>(Центр древа)"
+            else:
+                labels[member_id] = f"(Центр древа)"
+        else:
+            if show_names and show_relations:
+                labels[member_id] = f"{name_display}<br>({relation})"
+            elif show_names:
+                labels[member_id] = f"{name_display}"
+            elif show_relations:
+                labels[member_id] = f"({relation})"
+            else:
+                labels[member_id] = f"#{member_id}"
+        
+        # Определяем цвет узла в зависимости от пола и выбранной цветовой схемы
+        node_colors[member_id] = get_node_color(member["gender"], level, color_scheme)
+    
+    # Создаем фигуру plotly
+    fig = go.Figure()
+    
+    # Расставляем узлы по концентрическим кругам
+    max_level = max(nodes_by_level.keys()) if nodes_by_level else 4
+    radius_step = 1.0 / max_level if max_level > 0 else 1.0
+    
+    node_positions = {}
+    
+    # Размещаем центральный узел в центре
+    node_positions[central_person_id] = (0, 0)
+    
+    # Размещаем остальные узлы по концентрическим кругам
+    for level, node_ids in nodes_by_level.items():
+        if level == 0:  # Центральный узел уже размещен
+            continue
+        
+        radius = level * radius_step
+        node_count = len(node_ids)
+        
+        # Определяем начальный угол в зависимости от типа отношения
+        start_angles = {
+            1: {  # Прямая семья (родители - верхний полукруг, дети - нижний)
+                "parents": 45,      # Родители в верхней части
+                "children": 225,    # Дети в нижней части
+                "spouse": 135       # Супруги справа
+            },
+            2: {  # Расширенная семья
+                "grandparents": 30,  # Бабушки/дедушки вверху
+                "siblings": 100,     # Братья/сестры справа
+                "niblings": 260      # Племянники внизу-справа
+            }
+        }
+        
+        # Группируем узлы по типу отношения
+        grouped_nodes = {}
+        for node_id in node_ids:
+            relation = get_relation_to_person(members, relationships, central_person_id, node_id)
+            relation_type = get_relation_group(relation)
+            if relation_type not in grouped_nodes:
+                grouped_nodes[relation_type] = []
+            grouped_nodes[relation_type].append(node_id)
+        
+        # Размещаем узлы по группам
+        for group, group_nodes in grouped_nodes.items():
+            if level in start_angles and group in start_angles[level]:
+                start_angle = start_angles[level][group]
+            else:
+                start_angle = 0
+            
+            angle_step = 360 / max(20, len(node_ids))  # Минимум 20 для предотвращения перекрытий
+            
+            for i, node_id in enumerate(group_nodes):
+                angle = (start_angle + i * angle_step) % 360
+                x = radius * math.cos(math.radians(angle))
+                y = radius * math.sin(math.radians(angle))
+                node_positions[node_id] = (x, y)
+    
+    # Добавляем узлы (члены семьи) с метками
+    node_x = []
+    node_y = []
+    node_text = []
+    node_color = []
+    node_size = []
+    node_ids = []
+    
+    for member in members:
+        member_id = member["id"]
+        if member_id in node_positions:
+            x, y = node_positions[member_id]
+            node_x.append(x)
+            node_y.append(y)
+            node_text.append(labels[member_id])
+            node_color.append(node_colors[member_id])
+            
+            # Размер узлов адаптируется для мобильных устройств
+            if is_mobile:
+                # На мобильных делаем узлы больше для удобства тач-интерфейса
+                node_size.append(50 if member_id == central_person_id else 40)
+            else:
+                # На десктопах стандартный размер
+                node_size.append(40 if member_id == central_person_id else 30)
+                
+            node_ids.append(member_id)
+    
+    # Добавляем концентрические круги для контекста
+    for level in range(1, max_level+1):
+        radius = level * radius_step
+        circle_x = []
+        circle_y = []
+        
+        for angle in range(0, 361, 1):
+            circle_x.append(radius * math.cos(math.radians(angle)))
+            circle_y.append(radius * math.sin(math.radians(angle)))
+        
+        circle_trace = go.Scatter(
+            x=circle_x,
+            y=circle_y,
+            mode='lines',
+            line=dict(width=0.5, color='lightgrey'),
+            hoverinfo='none'
+        )
+        fig.add_trace(circle_trace)
+    
+    # Теперь добавляем связи между узлами, чтобы они были под узлами
+    # Родительские связи (сплошные линии)
+    parent_edge_x = []
+    parent_edge_y = []
+    
+    for rel in relationships:
+        parent_id = rel["parent_id"]
+        child_id = rel["child_id"]
+        
+        if parent_id in node_positions and child_id in node_positions:
+            x0, y0 = node_positions[parent_id]
+            x1, y1 = node_positions[child_id]
+            
+            parent_edge_x.append(x0)
+            parent_edge_x.append(x1)
+            parent_edge_x.append(None)
+            parent_edge_y.append(y0)
+            parent_edge_y.append(y1)
+            parent_edge_y.append(None)
+    
+    # Супружеские связи (пунктирные линии)
+    marriage_edge_x = []
+    marriage_edge_y = []
+    
+    marriage_pairs = find_marriage_pairs(relationships)
+    for pair in marriage_pairs:
+        id1, id2 = pair
+        if id1 in node_positions and id2 in node_positions:
+            x0, y0 = node_positions[id1]
+            x1, y1 = node_positions[id2]
+            
+            marriage_edge_x.append(x0)
+            marriage_edge_x.append(x1)
+            marriage_edge_x.append(None)
+            marriage_edge_y.append(y0)
+            marriage_edge_y.append(y1)
+            marriage_edge_y.append(None)
+    
+    # Рисуем родительские связи (сплошные линии)
+    parent_child_edges = go.Scatter(
+        x=parent_edge_x,
+        y=parent_edge_y,
+        mode='lines',
+        line=dict(width=1, color='#888'),
+        hoverinfo='none'
+    )
+    fig.add_trace(parent_child_edges)
+    
+    # Рисуем супружеские связи (пунктирные линии)
+    marriage_edges = go.Scatter(
+        x=marriage_edge_x,
+        y=marriage_edge_y,
+        mode='lines',
+        line=dict(width=1, color='#FF6666', dash='dash'),
+        hoverinfo='none'
+    )
+    fig.add_trace(marriage_edges)
+    
+    # Адаптивный размер шрифта и формат узлов в зависимости от устройства
+    text_size = 10
+    if is_mobile:
+        text_size = 8  # Уменьшаем размер текста на мобильных
+    
+    # Добавляем узлы на график поверх линий
+    nodes_trace = go.Scatter(
+        x=node_x, 
+        y=node_y,
+        mode='markers+text',
+        marker=dict(
+            size=node_size,
+            color=node_color,
+            line=dict(width=2, color='DarkSlateGrey')
+        ),
+        text=[f"{i}" for i in node_ids],  # Короткий текст внутри узла
+        hovertext=node_text,  # Полный текст для всплывающей подсказки
+        hoverinfo='text',
+        textposition="middle center",
+        textfont=dict(size=text_size)
+    )
+    
+    fig.add_trace(nodes_trace)
+    
+    # Настройка макета графика
+    title = f"Фамильное древо - центр: {central_person['name']}"
+    
+    # Адаптивный макет в зависимости от устройства
+    if is_mobile:
+        # Более компактный макет для мобильных с минимальными полями
+        fig.update_layout(
+            title=dict(
+                text=title,
+                font=dict(size=16)
+            ),
+            showlegend=False,
+            hovermode='closest',
+            margin=dict(b=10, l=5, r=5, t=30),
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            template="plotly_white",
+            dragmode="pan",  # Для мобильных лучше использовать режим панорамирования по умолчанию
+            height=450,      # Меньшая высота графика
+        )
+    else:
+        # Стандартный макет для десктопов
+        fig.update_layout(
+            title=title,
+            showlegend=False,
+            hovermode='closest',
+            margin=dict(b=20, l=5, r=5, t=40),
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            height=700,
+            template="plotly_white"
+        )
+    
+    # Настройки для лучшего взаимодействия на мобильных устройствах
+    config = {
+        "displayModeBar": True,
+        "responsive": True,
+        "scrollZoom": True,
+        "doubleClick": "reset",  # Двойной тап для сброса вида
+        "modeBarButtonsToRemove": ["select2d", "lasso2d", "toggleSpikelines"],
+        "toImageButtonOptions": {
+            "format": "png",
+            "filename": "family_tree",
+            "scale": 2  # Увеличиваем разрешение изображений для экспорта
+        }
+    }
+    
+    # Для мобильных устройств добавляем меньше элементов управления
+    if is_mobile:
+        config["modeBarButtonsToRemove"].extend(["hoverCompareCartesian", "hoverClosestCartesian"])
+    
+    return fig
+
 # Функции для определения мобильного устройства
 def is_mobile_device():
     """Определяет, запущено ли приложение на мобильном устройстве"""
@@ -1114,593 +1705,3 @@ try:
             st.rerun()
 except:
     pass
-
-# Функции для создания концентрической визуализации древа
-def calculate_relation_levels(members, relationships, central_person_id):
-    """
-    Вычисляет уровни родства всех членов семьи относительно центрального узла
-    
-    Returns:
-        dict: Словарь {id: уровень}, где уровень:
-            0 - центральный человек
-            1 - прямая семья (родители, дети, супруг/а)
-            2 - близкие родственники (бабушки/дедушки, братья/сестры)
-            3 - дальние родственники (дяди/тети, двоюродные)
-    """
-    levels = {central_person_id: 0}  # Центральный узел
-    
-    # Строим граф для анализа связей
-    G = build_family_graph(members, relationships)
-    
-    # Находим родителей, детей и супруга
-    parents = list(G.predecessors(central_person_id))
-    children = list(G.successors(central_person_id))
-    
-    # Находим супруга (общие дети)
-    spouse_ids = []
-    for child_id in children:
-        child_parents = list(G.predecessors(child_id))
-        for parent_id in child_parents:
-            if parent_id != central_person_id:
-                spouse_ids.append(parent_id)
-    
-    # Прямая семья (уровень 1)
-    for member_id in parents + children + spouse_ids:
-        levels[member_id] = 1
-    
-    # Находим братьев/сестер (общие родители)
-    siblings = []
-    for parent_id in parents:
-        for child_id in G.successors(parent_id):
-            if child_id != central_person_id and child_id not in siblings:
-                siblings.append(child_id)
-    
-    # Находим бабушек/дедушек (родители родителей)
-    grandparents = []
-    for parent_id in parents:
-        for gp_id in G.predecessors(parent_id):
-            if gp_id not in grandparents:
-                grandparents.append(gp_id)
-    
-    # Близкие родственники (уровень 2)
-    for member_id in siblings + grandparents:
-        levels[member_id] = 2
-    
-    # Дяди/тети (братья/сестры родителей)
-    uncles_aunts = []
-    for parent_id in parents:
-        parent_siblings = []
-        parent_parents = list(G.predecessors(parent_id))
-        for gp_id in parent_parents:
-            for child_id in G.successors(gp_id):
-                if child_id != parent_id and child_id not in uncles_aunts:
-                    uncles_aunts.append(child_id)
-    
-    # Племянники (дети братьев/сестер)
-    niblings = []
-    for sibling_id in siblings:
-        for child_id in G.successors(sibling_id):
-            if child_id not in niblings:
-                niblings.append(child_id)
-    
-    # Двоюродные (дети дядь/теть)
-    cousins = []
-    for ua_id in uncles_aunts:
-        for child_id in G.successors(ua_id):
-            if child_id not in cousins:
-                cousins.append(child_id)
-    
-    # Дальние родственники (уровень 3)
-    for member_id in uncles_aunts + niblings + cousins:
-        levels[member_id] = 3
-    
-    return levels
-
-def get_relation_to_person(members, relationships, central_id, person_id):
-    """
-    Определяет отношение человека к центральному узлу
-    """
-    if central_id == person_id:
-        return "Это я"
-    
-    # Строим граф для анализа отношений
-    G = nx.DiGraph()
-    for member in members:
-        G.add_node(member["id"], **member)
-    for rel in relationships:
-        G.add_edge(rel["parent_id"], rel["child_id"])
-    
-    # Находим прямых родителей центрального узла
-    parents = list(G.predecessors(central_id))
-    
-    # Находим прямых детей центрального узла
-    children = list(G.successors(central_id))
-    
-    # Находим братьев/сестер центрального узла (имеют тех же родителей)
-    siblings = []
-    for parent_id in parents:
-        for child_id in G.successors(parent_id):
-            if child_id != central_id and child_id not in siblings:
-                siblings.append(child_id)
-    
-    # Проверяем родительские связи
-    if person_id in parents:
-        person = next(m for m in members if m["id"] == person_id)
-        return "Отец" if person["gender"] == "Мужской" else "Мать"
-    
-    # Проверяем супружеские связи
-    marriage_pairs = find_marriage_pairs(relationships)
-    for pair in marriage_pairs:
-        if central_id in pair and person_id in pair:
-            person = next(m for m in members if m["id"] == person_id)
-            return "Муж" if person["gender"] == "Мужской" else "Жена"
-    
-    # Проверяем, является ли человек ребенком
-    if person_id in children:
-        person = next(m for m in members if m["id"] == person_id)
-        return "Сын" if person["gender"] == "Мужской" else "Дочь"
-    
-    # Проверяем, является ли человек братом/сестрой
-    if person_id in siblings:
-        person = next(m for m in members if m["id"] == person_id)
-        return "Брат" if person["gender"] == "Мужской" else "Сестра"
-    
-    # Проверяем бабушек/дедушек (родители родителей)
-    for parent_id in parents:
-        grandparents = list(G.predecessors(parent_id))
-        if person_id in grandparents:
-            person = next(m for m in members if m["id"] == person_id)
-            return "Дедушка" if person["gender"] == "Мужской" else "Бабушка"
-    
-    # Проверяем дядей/теть (братья/сестры родителей)
-    uncles_aunts = []
-    for parent_id in parents:
-        parent_parents = list(G.predecessors(parent_id))
-        for grandparent in parent_parents:
-            for uncle_aunt in G.successors(grandparent):
-                if uncle_aunt != parent_id and uncle_aunt not in uncles_aunts:
-                    uncles_aunts.append(uncle_aunt)
-    
-    if person_id in uncles_aunts:
-        person = next(m for m in members if m["id"] == person_id)
-        return "Дядя" if person["gender"] == "Мужской" else "Тетя"
-    
-    # Проверяем двоюродных братьев/сестер (дети дядей/теть)
-    cousins = []
-    for uncle_aunt in uncles_aunts:
-        for cousin in G.successors(uncle_aunt):
-            if cousin not in cousins:
-                cousins.append(cousin)
-    
-    if person_id in cousins:
-        person = next(m for m in members if m["id"] == person_id)
-        return "Двоюродный брат" if person["gender"] == "Мужской" else "Двоюродная сестра"
-    
-    # Проверяем племянников (дети братьев/сестер)
-    niblings = []
-    for sibling in siblings:
-        for child in G.successors(sibling):
-            if child not in niblings:
-                niblings.append(child)
-    
-    if person_id in niblings:
-        person = next(m for m in members if m["id"] == person_id)
-        return "Племянник" if person["gender"] == "Мужской" else "Племянница"
-    
-    # По умолчанию, если отношение не определено
-    return "Родственник"
-
-def find_marriage_pairs(relationships):
-    """
-    Находит супружеские пары на основе общих детей
-    """
-    # Словарь для группировки родителей по детям
-    parents_by_child = {}
-    
-    for rel in relationships:
-        child_id = rel["child_id"]
-        parent_id = rel["parent_id"]
-        
-        if child_id not in parents_by_child:
-            parents_by_child[child_id] = []
-        
-        parents_by_child[child_id].append(parent_id)
-    
-    # Находим пары родителей, у которых есть общие дети
-    marriage_pairs = set()
-    for child_id, parents in parents_by_child.items():
-        if len(parents) >= 2:
-            for i in range(len(parents)):
-                for j in range(i + 1, len(parents)):
-                    pair = tuple(sorted([parents[i], parents[j]]))
-                    marriage_pairs.add(pair)
-    
-    return list(marriage_pairs)
-
-def get_relation_group(relation):
-    """
-    Группирует типы отношений для размещения на концентрических кругах
-    """
-    parent_relations = ["Отец", "Мать"]
-    child_relations = ["Сын", "Дочь"]
-    spouse_relations = ["Муж", "Жена"]
-    grandparent_relations = ["Дедушка", "Бабушка"]
-    sibling_relations = ["Брат", "Сестра"]
-    uncle_aunt_relations = ["Дядя", "Тетя"]
-    cousin_relations = ["Двоюродный брат", "Двоюродная сестра"]
-    nibling_relations = ["Племянник", "Племянница"]
-    
-    if relation in parent_relations:
-        return "parents"
-    elif relation in child_relations:
-        return "children"
-    elif relation in spouse_relations:
-        return "spouse"
-    elif relation in grandparent_relations:
-        return "grandparents"
-    elif relation in sibling_relations:
-        return "siblings"
-    elif relation in uncle_aunt_relations:
-        return "uncles_aunts"
-    elif relation in cousin_relations:
-        return "cousins"
-    elif relation in nibling_relations:
-        return "niblings"
-    else:
-        return "other"
-
-def get_node_color(gender, level, color_scheme="standard"):
-    """
-    Определяет цвет узла в зависимости от пола, уровня родства и цветовой схемы
-    """
-    if color_scheme == "standard":
-        if gender == "Мужской":
-            # Оттенки синего для мужчин
-            colors = ["#0047AB", "#1E88E5", "#42A5F5", "#64B5F6", "#90CAF9"]
-        else:
-            # Оттенки розового для женщин
-            colors = ["#FF1493", "#FF69B4", "#FF80AB", "#F8BBD0", "#FCE4EC"]
-    
-    elif color_scheme == "contrast":
-        if gender == "Мужской":
-            # Контрастные синие
-            colors = ["#003366", "#0066CC", "#3399FF", "#66CCFF", "#99FFFF"]
-        else:
-            # Контрастные красные
-            colors = ["#990000", "#CC0000", "#FF0000", "#FF6666", "#FFCCCC"]
-    
-    elif color_scheme == "monochrome":
-        # Монохромная схема, разные оттенки серого
-        if gender == "Мужской":
-            colors = ["#222222", "#444444", "#666666", "#888888", "#AAAAAA"]
-        else:
-            colors = ["#333333", "#555555", "#777777", "#999999", "#BBBBBB"]
-    
-    else:  # Стандартная схема по умолчанию
-        if gender == "Мужской":
-            colors = ["#0047AB", "#1E88E5", "#42A5F5", "#64B5F6", "#90CAF9"]
-        else:
-            colors = ["#FF1493", "#FF69B4", "#FF80AB", "#F8BBD0", "#FCE4EC"]
-    
-    idx = min(level, len(colors)-1)
-    return colors[idx]
-
-def create_concentric_family_tree(members, relationships, central_person_id=3, show_names=True, show_relations=True, color_scheme="standard"):
-    """
-    Создает концентрическую визуализацию семейного древа с заданным центральным узлом.
-    
-    Args:
-        members: Список словарей с информацией о членах семьи
-        relationships: Список словарей с информацией о родственных связях
-        central_person_id: ID члена семьи, который будет в центре (по умолчанию Георгий Богданов, ID=3)
-        show_names: Показывать ли полные имена
-        show_relations: Показывать ли родственные связи
-        color_scheme: Цветовая схема ("standard", "contrast", "monochrome")
-        
-    Returns:
-        fig: Объект plotly Figure с визуализацией
-    """
-    import plotly.io as pio
-    
-    # Определяем, запущено ли приложение на мобильном устройстве
-    is_mobile = False
-    try:
-        if 'is_mobile' in st.session_state:
-            is_mobile = st.session_state.is_mobile
-    except ImportError:
-        pass
-    
-    # Вычисляем степень родства для каждого члена семьи относительно центрального узла
-    relation_levels = calculate_relation_levels(members, relationships, central_person_id)
-    
-    # Получаем центрального человека
-    central_person = next((m for m in members if m["id"] == central_person_id), None)
-    if not central_person:
-        return None
-    
-    # Создаем граф для анализа
-    G = build_family_graph(members, relationships)
-    
-    # Подготавливаем данные для визуализации
-    nodes_by_level = {}
-    labels = {}
-    node_colors = {}
-    
-    for member in members:
-        member_id = member["id"]
-        level = relation_levels.get(member_id, 4)  # Если уровень не определен, помещаем на 4й круг
-        
-        if level not in nodes_by_level:
-            nodes_by_level[level] = []
-        
-        nodes_by_level[level].append(member_id)
-        
-        # Определяем метку с именем и родством
-        relation = get_relation_to_person(members, relationships, central_person_id, member_id)
-        
-        # Для мобильного отображения - компактная версия имени
-        name_display = member['name']
-        if is_mobile:
-            # На мобильных устройствах укорачиваем длинные имена
-            name_parts = member['name'].split()
-            if len(name_parts) > 2:
-                if len(name_parts[0]) > 8 or len(name_parts[1]) > 8:
-                    # Если имя или фамилия длинные, показываем только первую букву отчества
-                    name_display = f"{name_parts[0]} {name_parts[1][0]}. {name_parts[-1]}"
-        
-        if member_id == central_person_id:
-            if show_names:
-                labels[member_id] = f"{name_display}<br>(Центр древа)"
-            else:
-                labels[member_id] = f"(Центр древа)"
-        else:
-            if show_names and show_relations:
-                labels[member_id] = f"{name_display}<br>({relation})"
-            elif show_names:
-                labels[member_id] = f"{name_display}"
-            elif show_relations:
-                labels[member_id] = f"({relation})"
-            else:
-                labels[member_id] = f"#{member_id}"
-        
-        # Определяем цвет узла в зависимости от пола и выбранной цветовой схемы
-        node_colors[member_id] = get_node_color(member["gender"], level, color_scheme)
-    
-    # Создаем фигуру plotly
-    fig = go.Figure()
-    
-    # Расставляем узлы по концентрическим кругам
-    max_level = max(nodes_by_level.keys()) if nodes_by_level else 4
-    radius_step = 1.0 / max_level if max_level > 0 else 1.0
-    
-    node_positions = {}
-    
-    # Размещаем центральный узел в центре
-    node_positions[central_person_id] = (0, 0)
-    
-    # Размещаем остальные узлы по концентрическим кругам
-    for level, node_ids in nodes_by_level.items():
-        if level == 0:  # Центральный узел уже размещен
-            continue
-        
-        radius = level * radius_step
-        node_count = len(node_ids)
-        
-        # Определяем начальный угол в зависимости от типа отношения
-        start_angles = {
-            1: {  # Прямая семья (родители - верхний полукруг, дети - нижний)
-                "parents": 45,      # Родители в верхней части
-                "children": 225,    # Дети в нижней части
-                "spouse": 135       # Супруги справа
-            },
-            2: {  # Расширенная семья
-                "grandparents": 30,  # Бабушки/дедушки вверху
-                "siblings": 100,     # Братья/сестры справа
-                "niblings": 260      # Племянники внизу-справа
-            }
-        }
-        
-        # Группируем узлы по типу отношения
-        grouped_nodes = {}
-        for node_id in node_ids:
-            relation = get_relation_to_person(members, relationships, central_person_id, node_id)
-            relation_type = get_relation_group(relation)
-            if relation_type not in grouped_nodes:
-                grouped_nodes[relation_type] = []
-            grouped_nodes[relation_type].append(node_id)
-        
-        # Размещаем узлы по группам
-        for group, group_nodes in grouped_nodes.items():
-            if level in start_angles and group in start_angles[level]:
-                start_angle = start_angles[level][group]
-            else:
-                start_angle = 0
-            
-            angle_step = 360 / max(20, len(node_ids))  # Минимум 20 для предотвращения перекрытий
-            
-            for i, node_id in enumerate(group_nodes):
-                angle = (start_angle + i * angle_step) % 360
-                x = radius * math.cos(math.radians(angle))
-                y = radius * math.sin(math.radians(angle))
-                node_positions[node_id] = (x, y)
-    
-    # Добавляем узлы (члены семьи) с метками
-    node_x = []
-    node_y = []
-    node_text = []
-    node_color = []
-    node_size = []
-    node_ids = []
-    
-    for member in members:
-        member_id = member["id"]
-        if member_id in node_positions:
-            x, y = node_positions[member_id]
-            node_x.append(x)
-            node_y.append(y)
-            node_text.append(labels[member_id])
-            node_color.append(node_colors[member_id])
-            
-            # Размер узлов адаптируется для мобильных устройств
-            if is_mobile:
-                # На мобильных делаем узлы больше для удобства тач-интерфейса
-                node_size.append(50 if member_id == central_person_id else 40)
-            else:
-                # На десктопах стандартный размер
-                node_size.append(40 if member_id == central_person_id else 30)
-                
-            node_ids.append(member_id)
-    
-    # Добавляем концентрические круги для контекста
-    for level in range(1, max_level+1):
-        radius = level * radius_step
-        circle_x = []
-        circle_y = []
-        
-        for angle in range(0, 361, 1):
-            circle_x.append(radius * math.cos(math.radians(angle)))
-            circle_y.append(radius * math.sin(math.radians(angle)))
-        
-        circle_trace = go.Scatter(
-            x=circle_x,
-            y=circle_y,
-            mode='lines',
-            line=dict(width=0.5, color='lightgrey'),
-            hoverinfo='none'
-        )
-        fig.add_trace(circle_trace)
-    
-    # Теперь добавляем связи между узлами, чтобы они были под узлами
-    # Родительские связи (сплошные линии)
-    parent_edge_x = []
-    parent_edge_y = []
-    
-    for rel in relationships:
-        parent_id = rel["parent_id"]
-        child_id = rel["child_id"]
-        
-        if parent_id in node_positions and child_id in node_positions:
-            x0, y0 = node_positions[parent_id]
-            x1, y1 = node_positions[child_id]
-            
-            parent_edge_x.append(x0)
-            parent_edge_x.append(x1)
-            parent_edge_x.append(None)
-            parent_edge_y.append(y0)
-            parent_edge_y.append(y1)
-            parent_edge_y.append(None)
-    
-    # Супружеские связи (пунктирные линии)
-    marriage_edge_x = []
-    marriage_edge_y = []
-    
-    marriage_pairs = find_marriage_pairs(relationships)
-    for pair in marriage_pairs:
-        id1, id2 = pair
-        if id1 in node_positions and id2 in node_positions:
-            x0, y0 = node_positions[id1]
-            x1, y1 = node_positions[id2]
-            
-            marriage_edge_x.append(x0)
-            marriage_edge_x.append(x1)
-            marriage_edge_x.append(None)
-            marriage_edge_y.append(y0)
-            marriage_edge_y.append(y1)
-            marriage_edge_y.append(None)
-    
-    # Рисуем родительские связи (сплошные линии)
-    parent_child_edges = go.Scatter(
-        x=parent_edge_x,
-        y=parent_edge_y,
-        mode='lines',
-        line=dict(width=1, color='#888'),
-        hoverinfo='none'
-    )
-    fig.add_trace(parent_child_edges)
-    
-    # Рисуем супружеские связи (пунктирные линии)
-    marriage_edges = go.Scatter(
-        x=marriage_edge_x,
-        y=marriage_edge_y,
-        mode='lines',
-        line=dict(width=1, color='#FF6666', dash='dash'),
-        hoverinfo='none'
-    )
-    fig.add_trace(marriage_edges)
-    
-    # Адаптивный размер шрифта и формат узлов в зависимости от устройства
-    text_size = 10
-    if is_mobile:
-        text_size = 8  # Уменьшаем размер текста на мобильных
-    
-    # Добавляем узлы на график поверх линий
-    nodes_trace = go.Scatter(
-        x=node_x, 
-        y=node_y,
-        mode='markers+text',
-        marker=dict(
-            size=node_size,
-            color=node_color,
-            line=dict(width=2, color='DarkSlateGrey')
-        ),
-        text=[f"{i}" for i in node_ids],  # Короткий текст внутри узла
-        hovertext=node_text,  # Полный текст для всплывающей подсказки
-        hoverinfo='text',
-        textposition="middle center",
-        textfont=dict(size=text_size)
-    )
-    
-    fig.add_trace(nodes_trace)
-    
-    # Настройка макета графика
-    title = f"Фамильное древо - центр: {central_person['name']}"
-    
-    # Адаптивный макет в зависимости от устройства
-    if is_mobile:
-        # Более компактный макет для мобильных с минимальными полями
-        fig.update_layout(
-            title=dict(
-                text=title,
-                font=dict(size=16)
-            ),
-            showlegend=False,
-            hovermode='closest',
-            margin=dict(b=10, l=5, r=5, t=30),
-            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            template="plotly_white",
-            dragmode="pan",  # Для мобильных лучше использовать режим панорамирования по умолчанию
-            height=450,      # Меньшая высота графика
-        )
-    else:
-        # Стандартный макет для десктопов
-        fig.update_layout(
-            title=title,
-            showlegend=False,
-            hovermode='closest',
-            margin=dict(b=20, l=5, r=5, t=40),
-            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            height=700,
-            template="plotly_white"
-        )
-    
-    # Настройки для лучшего взаимодействия на мобильных устройствах
-    config = {
-        "displayModeBar": True,
-        "responsive": True,
-        "scrollZoom": True,
-        "doubleClick": "reset",  # Двойной тап для сброса вида
-        "modeBarButtonsToRemove": ["select2d", "lasso2d", "toggleSpikelines"],
-        "toImageButtonOptions": {
-            "format": "png",
-            "filename": "family_tree",
-            "scale": 2  # Увеличиваем разрешение изображений для экспорта
-        }
-    }
-    
-    # Для мобильных устройств добавляем меньше элементов управления
-    if is_mobile:
-        config["modeBarButtonsToRemove"].extend(["hoverCompareCartesian", "hoverClosestCartesian"])
-    
-    return fig
